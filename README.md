@@ -25,7 +25,7 @@
 - [11. 自动化测试与并发测试](#11-自动化测试与并发测试)
 - [12. 核心技术亮点](#12-核心技术亮点)
 - [13. 工程优化案例](#13-工程优化案例)
-- [14. AI-Assisted Development](#14-ai-assisted-development)
+- [14. 开发方式](#14-开发方式)
 
 ---
 
@@ -36,11 +36,7 @@
 1. **并发一致性**：同一账户同时收到多笔扣费请求时，余额不能被超扣，累计消费金额不能出现丢失更新。
 2. **幂等性**：网络超时、自动重试或用户重复点击可能导致同一笔业务被重复提交，系统必须保证同一笔交易只执行一次，并让重复请求得到一致结果。
 
-本项目以“阶梯折扣计费”为业务场景，实现一个完整、可运行、经过单元测试、集成测试与真实多线程并发测试验证的后端服务。
-
-核心目标是：
-
-> 在并发和重复请求场景下，保证账户余额、累计消费额和交易流水始终保持一致。
+本项目以阶梯折扣计费为业务场景，实现扣费、余额查询、多币种换算和幂等处理，并通过单元测试、集成测试及多线程并发测试验证账户余额、累计消费额和交易流水的一致性。
 
 ---
 
@@ -81,7 +77,7 @@
 - 用户重复提交同一笔业务时复用同一个 `requestId`；
 - 只有新交易才生成新的 `requestId`。
 
-前端防重复提交只能改善用户体验，真正的幂等保障必须由后端完成。
+前端可以避免部分重复提交，但后端仍需要通过 `requestId` 保证业务幂等。
 
 ---
 
@@ -98,7 +94,7 @@
 | Testing | Spring Boot Test / MockMvc / JUnit | 单元、集成与并发测试 |
 | Build | Maven / Maven Wrapper | 项目构建与依赖管理 |
 
-其中 Java 17 与 Spring Boot 4.1.0 均由 `pom.xml` 明确指定；MySQL Connector、H2、JPA/Hibernate 与测试依赖的具体小版本由 Spring Boot 的依赖管理统一解析，因此 README 不额外写死这些版本号。
+项目基于 Java 17 与 Spring Boot 4.1.0 开发，持久层采用 Spring Data JPA，生产环境使用 MySQL，测试环境使用 H2。
 
 ---
 
@@ -300,11 +296,9 @@ GET /api/v1/billing/balance/{userId}
 mysql -u root -p < sql/schema.sql
 ```
 
-### 8.2 配置数据库密码
+### 8.2 配置数据库连接
 
-项目不会在 Git 仓库中保存真实数据库密码。
-
-`application.properties` 使用环境变量：
+数据库密码通过环境变量 `DB_PASSWORD` 注入：
 
 ```properties
 spring.datasource.password=${DB_PASSWORD}
@@ -476,15 +470,11 @@ setScale(2, RoundingMode.HALF_UP)
 → 写入交易流水
 ```
 
-这些操作必须作为一个整体完成。
-
-因此系统使用事务保证：
-
-> 要么全部成功提交，要么全部回滚。
+这些操作放在同一事务中执行，任一步骤失败都会整体回滚。
 
 ### 12.3 悲观锁防止 Lost Update
 
-同一账户发生并发扣费时，如果多个线程同时读取旧余额，会产生后写覆盖前写的问题。
+同一账户并发扣费时，多个线程可能读取到相同旧余额，造成更新覆盖。
 
 项目通过：
 
@@ -518,25 +508,17 @@ billing_transaction.request_id
 uk_tx_request_id
 ```
 
-即使多个线程同时通过应用层的“先查后写”，数据库仍能保证同一个 `requestId` 最终只能写入一条记录。
+数据库唯一索引保证同一个 `requestId` 只能写入一条交易记录。
 
 ### 12.5 数据幂等与响应幂等
 
-数据幂等只保证：
-
-> 同一笔业务不会产生重复数据。
-
-响应幂等进一步要求：
-
-> 重复请求不仅不能重复扣款，还必须返回与首次请求一致的业务结果。
-
-本项目最终同时实现这两层幂等。
+数据幂等保证同一笔业务不会重复落库；响应幂等则要求重复请求返回与首次请求一致的结果。本项目同时覆盖这两部分。
 
 ---
 
 ## 13. 工程优化案例
 
-本项目中最重要的一次优化，是从“数据幂等”升级为“响应幂等”。
+项目在并发测试中进一步完善了幂等处理，从只保证数据不重复，改进为重复请求也能返回一致结果。
 
 ### 13.1 初版设计
 
@@ -562,19 +544,7 @@ findByRequestId
 9 个线程触发唯一索引冲突
 ```
 
-最终数据虽然正确，只生成 1 条流水并只扣款 1 次，但其他调用方收到了数据库异常。
-
-这意味着初版只实现了：
-
-```text
-数据幂等
-```
-
-还没有真正实现：
-
-```text
-响应幂等
-```
+最终数据库中只有 1 条流水、账户也只扣款 1 次，但其余请求会收到唯一索引异常。说明初版能够保证数据幂等，但对调用方的响应还不够稳定。
 
 ### 13.3 根因
 
@@ -582,9 +552,7 @@ findByRequestId
 
 事务一旦因为数据库异常被标记为 `rollback-only`，就无法继续在同一个事务中可靠地查询已提交结果并返回。
 
-问题的核心不是唯一索引本身，而是：
-
-> 幂等恢复逻辑与事务核心逻辑绑定在了同一个事务边界中。
+根因在于幂等恢复逻辑与核心扣费逻辑处于同一个事务边界内。
 
 ### 13.4 优化方案
 
@@ -627,20 +595,9 @@ deduct(...)
 
 ---
 
-## 14. AI-Assisted Development
+## 14. 开发方式
 
-This project was developed with an AI-assisted coding workflow using **Claude Code**.
-
-AI tools were used to support:
-
-- requirement decomposition;
-- implementation assistance;
-- debugging and code review;
-- unit and integration test generation;
-- concurrency test design;
-- iterative verification and refactoring.
-
-The project was continuously validated through manual API testing, automated tests and multi-thread concurrency testing rather than relying solely on generated code.
+开发过程中使用 Claude Code 辅助需求拆解、代码编写、调试和测试设计；关键业务逻辑通过手工接口验证、自动化测试和多线程并发测试进行确认。
 
 ---
 
